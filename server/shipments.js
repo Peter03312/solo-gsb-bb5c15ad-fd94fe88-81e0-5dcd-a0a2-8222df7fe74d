@@ -70,6 +70,17 @@ function createShipment(db, body) {
   const batch = db.prepare('SELECT id, code FROM batches WHERE id = ?').get(batch_id);
   if (!batch) throw new ShipmentError('BATCH_NOT_FOUND', '出货批次不存在');
 
+  // 质量隔离令：受控批次不得确认出货（解除或流向变化脱离全部生效令后恢复）。
+  const quarantine = require('./quarantine');
+  const qOrders = quarantine.batchOrders(db, batch_id);
+  if (qOrders.length) {
+    throw new ShipmentError(
+      'BATCH_QUARANTINED',
+      `批次 ${batch.code} 处于质量隔离令生效范围（${quarantine.describeOrders(qOrders)}），` +
+      '隔离期间不得确认出货；解除隔离或流向变化脱离全部生效令后恢复'
+    );
+  }
+
   // 规范化并去重：同一卷在一张出货单中只能出现一次。
   const allocations = [];
   const seenRolls = new Set();
@@ -143,6 +154,16 @@ function createShipment(db, body) {
   const inserted = { id: null };
   const tx = db.transaction(() => {
     // ---- 事务内权威复核（最新数据 + 锁内串行）----
+    // 质量隔离令：批次受控时整单拒绝（与签发/范围刷新互斥于各自事务）。
+    const quar = require('./quarantine');
+    const qOrdersInTx = quar.batchOrders(db, batch_id);
+    if (qOrdersInTx.length) {
+      throw new ShipmentError(
+        'BATCH_QUARANTINED',
+        `批次 ${batch.code} 处于质量隔离令生效范围（${quar.describeOrders(qOrdersInTx)}），` +
+        '隔离期间不得确认出货；整单拒绝、不占用数量'
+      );
+    }
     const resolved = [];
     for (const a of allocations) {
       const roll = db.prepare('SELECT * FROM label_rolls WHERE id = ?').get(a.roll_id);
@@ -366,6 +387,8 @@ function formatShipment(s, db) {
     status: s.status,
     pending_review: s.status === 'PENDING_REVIEW',
     review_reason: s.review_reason || '',
+    // 批次当前是否处于质量隔离令生效范围（隔离期间只能登记召回）。
+    batch_quarantined: db ? require('./quarantine').isBatchControlled(db, s.batch_id) : false,
     shipped_at: s.shipped_at,
     shipped_by: s.shipped_by,
     created_at: s.created_at,

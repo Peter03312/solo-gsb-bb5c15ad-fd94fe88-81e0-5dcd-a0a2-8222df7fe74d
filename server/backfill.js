@@ -663,7 +663,8 @@ function submitBackfill(db, rawBody) {
       invalidated: recomputeResult.invalidated,
       retired_rolls: recomputeResult.retiredRolls,
       pending_shipments: recomputeResult.pendingShipments,
-      stale_dispositions: recomputeResult.staleDispositions
+      stale_dispositions: recomputeResult.staleDispositions,
+      quarantine: recomputeResult.quarantine
     };
     const impact_summary = {
       inserted_events: insertedEvents.length,
@@ -672,7 +673,9 @@ function submitBackfill(db, rawBody) {
       invalidated_releases: impact.invalidated.length,
       retired_label_rolls: impact.retired_rolls.length,
       pending_shipments: impact.pending_shipments.length,
-      stale_dispositions: impact.stale_dispositions.length
+      stale_dispositions: impact.stale_dispositions.length,
+      quarantine_controlled_batches: impact.quarantine.newly_controlled.length,
+      quarantine_released_batches: impact.quarantine.released.length
     };
 
     // 落补录台账（先写包头，再逐条写记录）。
@@ -711,7 +714,8 @@ function submitBackfill(db, rawBody) {
       invalidated: impact.invalidated,
       retired_rolls: impact.retired_rolls,
       pending_shipments: impact.pending_shipments,
-      stale_dispositions: impact.stale_dispositions
+      stale_dispositions: impact.stale_dispositions,
+      quarantine: impact.quarantine
     };
 
     // 回填完整响应供同号重试原样返回。

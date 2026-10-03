@@ -242,6 +242,37 @@ function initSchema(d) {
     UNIQUE (backfill_id, external_ref)
   );
 
+  -- 质量隔离令：质检针对“原料 + 供应批号”签发/解除的隔离指令。
+  --   签发记录原因、操作人、时间；解除同样记录且为终态（不再改回）；台账只增不改、永不删除。
+  --   同一批号同时最多一张生效令（由下方部分唯一索引 idx_quarantine_active_lot 强制）。
+  --   批号的 FLAGGED 异常标记仍只作留痕，与本表互不影响。
+  CREATE TABLE IF NOT EXISTS quarantine_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_code TEXT NOT NULL UNIQUE,      -- 隔离令号，如 QUAR-0001（签发事务内补发）
+    lot_id INTEGER NOT NULL REFERENCES material_lots(id),
+    reason TEXT NOT NULL DEFAULT '',      -- 签发原因
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','LIFTED')),
+    issued_by TEXT NOT NULL DEFAULT '',   -- 签发操作人
+    issued_at TEXT NOT NULL,              -- 签发时间
+    lifted_by TEXT,                       -- 解除操作人（生效中为 NULL）
+    lifted_at TEXT,                       -- 解除时间
+    lift_reason TEXT NOT NULL DEFAULT '', -- 解除原因
+    lifted_scope_json TEXT NOT NULL DEFAULT '[]', -- 解除时生效范围快照（留痕）
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 隔离令当前生效范围（派生数据）：按当前事件时间线的批号流向（直接投料/前序引用/
+  --   设备残留；确定命中与批号未知无法排除均受控）逐时计算；原料资料、事件更正/删除、
+  --   断网补录、整组换线或清洗变化后，在同一事务内整体重写。
+  --   批次不加外键：批次可能随事件删除消失，范围随刷新自动清除。
+  CREATE TABLE IF NOT EXISTS quarantine_scope (
+    order_id INTEGER NOT NULL REFERENCES quarantine_orders(id) ON DELETE CASCADE,
+    batch_id INTEGER NOT NULL,
+    classification TEXT NOT NULL CHECK (classification IN ('CONFIRMED','UNRESOLVED')),
+    evidence_json TEXT NOT NULL DEFAULT '{}',  -- 传播依据（链/途径快照，供展示）
+    PRIMARY KEY (order_id, batch_id)
+  );
+
   -- 设备检修停机窗口：检修期间不能记录加工或清洗。
   --   窗口为左闭右开区间 [start_time, end_time)，起点须早于终点；
   --   同设备窗口不可重叠（相邻允许：一个的终点可等于另一个的起点）；
@@ -278,6 +309,11 @@ function initSchema(d) {
   -- 故不加全局唯一约束；“同号不同内容整包拒绝”在提交校验中按首次出现记录比对哈希强制。
   CREATE INDEX IF NOT EXISTS idx_backfill_records_external ON backfill_records(external_ref);
   CREATE INDEX IF NOT EXISTS idx_downtime_windows_equipment ON equipment_downtime_windows(equipment_id);
+  CREATE INDEX IF NOT EXISTS idx_quarantine_orders_lot ON quarantine_orders(lot_id);
+  -- 同一批号同时只能有一张生效令（部分唯一索引只约束 ACTIVE 行；历史已解除令不限）。
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_quarantine_active_lot
+    ON quarantine_orders(lot_id) WHERE status = 'ACTIVE';
+  CREATE INDEX IF NOT EXISTS idx_quarantine_scope_batch ON quarantine_scope(batch_id);
   `);
 
   // ---- 旧库迁移（CREATE TABLE IF NOT EXISTS 不会为既有表补列）----

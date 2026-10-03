@@ -135,6 +135,8 @@ function buildContext(db, s) {
     uncovered_allergens: [],
     snapshot_covers_current: false,
     has_active_release: false,
+    batch_quarantined: false,
+    quarantine_orders: [],
     can_continue: false
   };
 
@@ -199,8 +201,27 @@ function buildContext(db, s) {
     : [];
   ctx.snapshot_covers_current = ctx.batch_produced && ctx.uncovered_allergens.length === 0;
   ctx.has_active_release = ctx.active_releases.length > 0;
+
+  // 质量隔离令：批次处于任一隔离令生效范围时，隔离期间只能召回（不准予继续流转）。
+  // 隔离状态不纳入上下文指纹：新受控时由隔离级联显式把有效“准予继续流转”结论转需重评，
+  // 解除时不自动改动任何历史结论。
+  if (ctx.batch_exists) {
+    const quarantine = require('./quarantine');
+    const qOrders = quarantine.batchOrders(db, s.batch_id);
+    ctx.batch_quarantined = qOrders.length > 0;
+    ctx.quarantine_orders = qOrders.map((o) => ({
+      order_id: o.order_id,
+      order_code: o.order_code,
+      lot_id: o.lot_id,
+      lot_code: o.lot_code,
+      material_code: o.material_code,
+      material_name: o.material_name,
+      classification: o.classification
+    }));
+  }
+
   ctx.can_continue = ctx.batch_exists && ctx.batch_produced &&
-    ctx.has_active_release && ctx.snapshot_covers_current;
+    ctx.has_active_release && ctx.snapshot_covers_current && !ctx.batch_quarantined;
   return ctx;
 }
 
@@ -242,6 +263,14 @@ function continueBlockers(ctx) {
   }
   if (ctx.batch_exists && !ctx.has_active_release) {
     blockers.push('当前没有有效放行记录，不允许准予继续流转，只能召回');
+  }
+  if (ctx.batch_quarantined) {
+    const desc = ctx.quarantine_orders
+      .map((o) => `${o.order_code}（${o.material_name} 批号 ${o.lot_code}）`)
+      .join('、');
+    blockers.push(
+      `批次处于质量隔离令生效范围（${desc}），隔离期间只能召回，不允许准予继续流转`
+    );
   }
   return blockers;
 }
@@ -304,19 +333,24 @@ function getEvaluation(db, idOrCode) {
       shipped_by: row.shipped_by,
       items: s.items
     },
-    // 当前批次过敏原、有效放行、所用卷停用原因。
+    // 当前批次过敏原、有效放行、所用卷停用原因、生效中的质量隔离令。
     current_state: {
       batch_exists: ctx.batch_exists,
       batch_id: ctx.batch_id,
       batch_code: ctx.batch_code,
       batch_allergens: ctx.batch_allergens,
       active_releases: ctx.active_releases,
-      used_rolls: ctx.used_rolls
+      used_rolls: ctx.used_rolls,
+      batch_quarantined: ctx.batch_quarantined,
+      quarantine_orders: ctx.quarantine_orders
     },
     conditions: {
       batch_exists: ctx.batch_exists && ctx.batch_produced,
       has_active_release: ctx.has_active_release,
       snapshot_covers_current: ctx.snapshot_covers_current,
+      not_quarantined: !ctx.batch_quarantined,
+      quarantined: ctx.batch_quarantined,
+      quarantine_orders: ctx.quarantine_orders,
       uncovered_allergens: ctx.uncovered_allergens,
       can_continue: ctx.can_continue,
       only_recall: !ctx.can_continue,

@@ -239,14 +239,31 @@ function recompute(db) {
 
   // ---- 出货单待评估：本次停用的卷若已分配给出货单，则相关单据置为待评估（终态不恢复）----
   const shipments = require('./shipments');
-  const pendingShipments = shipments.syncPendingShipments(db);
+  let pendingShipments = shipments.syncPendingShipments(db);
 
   // ---- 质量处置结论核对：批次过敏原 / 有效放行 / 所用卷停用信息变化后，
   //      仍为 ACTIVE 的旧结论标为“需重新评估”（STALE，只增不改、不自动生效）----
   const evaluation = require('./evaluation');
-  const staleDispositions = evaluation.syncStaleDispositions(db);
+  let staleDispositions = evaluation.syncStaleDispositions(db);
 
-  return { invalidated, retiredRolls, pendingShipments, staleDispositions };
+  // ---- 质量隔离令：按最新时间线刷新全部生效令的受控范围（确定命中 + 批号未知
+  //      无法排除均受控）；新受控批次的关联出货单转待评估、有效“准予继续流转”
+  //      结论转需重评，与本次重算在同一事务内原子完成 ----
+  const quarantine = require('./quarantine');
+  const quarSync = quarantine.syncScopes(db);
+  pendingShipments = pendingShipments.concat(quarSync.pendingShipments);
+  staleDispositions = staleDispositions.concat(quarSync.staleDispositions);
+
+  return {
+    invalidated,
+    retiredRolls,
+    pendingShipments,
+    staleDispositions,
+    quarantine: {
+      newly_controlled: quarSync.newly_controlled,
+      released: quarSync.released
+    }
+  };
 }
 
 module.exports = { recompute, replayTimeline, sortedJson, cleanScopeOf };

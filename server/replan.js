@@ -376,7 +376,13 @@ const FINGERPRINT_SQL = [
   `SELECT shipment_id, version FROM shipment_versions ORDER BY shipment_id`,
   // 停机窗口同样纳入指纹：窗口登记/调整/取消后，旧预演版本过期，确认应用须重新预演核对。
   `SELECT id, equipment_id, start_time, end_time, reason, operator, created_at, updated_at
-     FROM equipment_downtime_windows ORDER BY id`
+     FROM equipment_downtime_windows ORDER BY id`,
+  // 质量隔离令与其生效范围同样纳入指纹：签发/解除/范围刷新会影响“待评估出货单”等
+  // 预演预测，旧预演版本应过期。
+  `SELECT id, order_code, lot_id, reason, status, issued_by, issued_at,
+          lifted_by, lifted_at, lift_reason, lifted_scope_json
+     FROM quarantine_orders ORDER BY id`,
+  'SELECT order_id, batch_id, classification, evidence_json FROM quarantine_scope ORDER BY order_id, batch_id'
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -687,6 +693,9 @@ function openShadow(sourceDb) {
   copy('shipment_versions', 'shipment_id,version');
   // 停机窗口一并拷入影子库：预演按整组变更后的最终设备与时间核对窗口（不写正式数据）。
   copy('equipment_downtime_windows', 'id,equipment_id,start_time,end_time,reason,operator,created_at,updated_at');
+  // 质量隔离令与生效范围一并拷入：预演按整组变更后的时间线重算隔离范围并预测级联。
+  copy('quarantine_orders', 'id,order_code,lot_id,reason,status,issued_by,issued_at,lifted_by,lifted_at,lift_reason,lifted_scope_json,created_at');
+  copy('quarantine_scope', 'order_id,batch_id,classification,evidence_json');
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
@@ -703,7 +712,7 @@ function simulate(db, changes) {
     if (errors.length) {
       throw new ReplanError('REPLAN_REJECTED', '整组变更应用后的时间线校验未通过', errors);
     }
-    recompute(shadow);
+    const recomputeResult = recompute(shadow);
     const after = takeSnapshot(shadow);
     // 影子库中“正式库原为 ACTIVE、重算后转为 RETIRED”的标签卷（本已停用的不计入“将停用”）
     const activeRealIds = new Set(db.prepare(
@@ -757,6 +766,11 @@ function simulate(db, changes) {
     diff.summary.shipments_will_pending = pendingShipments.length;
     diff.dispositions_will_stale = staleDispositions;
     diff.summary.dispositions_will_stale = staleDispositions.length;
+    // 质量隔离令：整组变更后生效范围的变化（新受控 / 脱离受控的批次）。
+    diff.quarantine_will_control = recomputeResult.quarantine.newly_controlled;
+    diff.quarantine_will_release = recomputeResult.quarantine.released;
+    diff.summary.quarantine_will_control = recomputeResult.quarantine.newly_controlled.length;
+    diff.summary.quarantine_will_release = recomputeResult.quarantine.released.length;
     return { resolved, inserted, after, diff };
   } finally {
     shadow.close();
@@ -818,7 +832,7 @@ function apply(db, body) {
     if (errors.length) {
       throw new ReplanError('REPLAN_REJECTED', '整组变更应用后的时间线校验未通过', errors);
     }
-    const { invalidated, retiredRolls, pendingShipments, staleDispositions } = recompute(db);
+    const { invalidated, retiredRolls, pendingShipments, staleDispositions, quarantine } = recompute(db);
     const after = takeSnapshot(db);
     const appliedDiff = diffSnapshots(before, after);
     appliedDiff.label_rolls_will_retire = retiredRolls.map((r) => ({
@@ -832,6 +846,11 @@ function apply(db, body) {
     // 旧质量处置结论被标为需重新评估（只增不改，不自动生效）。
     appliedDiff.dispositions_will_stale = staleDispositions;
     appliedDiff.summary.dispositions_will_stale = staleDispositions.length;
+    // 质量隔离令生效范围变化（新受控 / 脱离受控的批次）。
+    appliedDiff.quarantine_will_control = quarantine.newly_controlled;
+    appliedDiff.quarantine_will_release = quarantine.released;
+    appliedDiff.summary.quarantine_will_control = quarantine.newly_controlled.length;
+    appliedDiff.summary.quarantine_will_release = quarantine.released.length;
 
     // 提交后再计算一次指纹，作为新的业务版本随结果返回。
     response = {
@@ -843,6 +862,7 @@ function apply(db, body) {
       retired_rolls: retiredRolls,
       pending_shipments: pendingShipments,
       stale_dispositions: staleDispositions,
+      quarantine,
       diff: appliedDiff
     };
   });

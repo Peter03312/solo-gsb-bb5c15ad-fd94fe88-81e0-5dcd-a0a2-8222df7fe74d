@@ -65,6 +65,17 @@ function registerRoll(db, body) {
   const ev = db.prepare('SELECT id FROM events WHERE batch_id = ?').get(batch_id);
   if (!out || !ev) throw new LabelError('BATCH_NOT_PRODUCED', '该批次尚无加工记录，无法登记标签卷');
 
+  // 质量隔离令：受控批次不得登记标签卷（解除或流向变化脱离全部生效令后恢复）。
+  const quarantine = require('./quarantine');
+  const qOrders = quarantine.batchOrders(db, batch_id);
+  if (qOrders.length) {
+    throw new LabelError(
+      'BATCH_QUARANTINED',
+      `批次 ${batch.code} 处于质量隔离令生效范围（${quarantine.describeOrders(qOrders)}），` +
+      '隔离期间不得登记标签卷；解除隔离或流向变化脱离全部生效令后恢复'
+    );
+  }
+
   const release = db.prepare(
     'SELECT id, batch_id, status, snapshot_allergens FROM releases WHERE id = ?'
   ).get(release_id);
@@ -140,6 +151,16 @@ function consumeRoll(db, id, body) {
   const tx = db.transaction(() => {
     const cur = db.prepare('SELECT revision, applied_qty, void_qty, print_qty FROM label_rolls WHERE id = ?').get(id);
     if (!cur) throw new LabelError('ROLL_NOT_FOUND', '标签卷不存在');
+    // 质量隔离令：所属批次受控时暂停贴用（不永久停用；脱离全部生效令后恢复核销）。
+    const quarantine = require('./quarantine');
+    const qOrders = quarantine.batchOrders(db, roll.batch_id);
+    if (qOrders.length) {
+      throw new LabelError(
+        'ROLL_QUARANTINED',
+        `卷 ${roll.roll_code} 所属批次处于质量隔离令生效范围（${quarantine.describeOrders(qOrders)}），` +
+        '已暂停贴用（不永久停用）；解除隔离或流向变化脱离全部生效令后恢复'
+      );
+    }
     if (cur.revision !== expected_revision) {
       throw new LabelError(
         'REVISION_MISMATCH',
