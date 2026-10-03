@@ -663,7 +663,9 @@ function submitBackfill(db, rawBody) {
       invalidated: recomputeResult.invalidated,
       retired_rolls: recomputeResult.retiredRolls,
       pending_shipments: recomputeResult.pendingShipments,
-      stale_dispositions: recomputeResult.staleDispositions
+      stale_dispositions: recomputeResult.staleDispositions,
+      suspended_rolls: recomputeResult.suspendedRolls || [],
+      resumed_rolls: recomputeResult.resumedRolls || []
     };
     const impact_summary = {
       inserted_events: insertedEvents.length,
@@ -672,7 +674,9 @@ function submitBackfill(db, rawBody) {
       invalidated_releases: impact.invalidated.length,
       retired_label_rolls: impact.retired_rolls.length,
       pending_shipments: impact.pending_shipments.length,
-      stale_dispositions: impact.stale_dispositions.length
+      stale_dispositions: impact.stale_dispositions.length,
+      suspended_label_rolls: impact.suspended_rolls.length,
+      resumed_label_rolls: impact.resumed_rolls.length
     };
 
     // 落补录台账（先写包头，再逐条写记录）。

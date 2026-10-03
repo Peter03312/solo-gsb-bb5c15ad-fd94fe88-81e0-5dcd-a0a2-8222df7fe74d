@@ -135,6 +135,8 @@ function buildContext(db, s) {
     uncovered_allergens: [],
     snapshot_covers_current: false,
     has_active_release: false,
+    quarantined: false,
+    quarantine_orders: [],
     can_continue: false
   };
 
@@ -162,6 +164,19 @@ function buildContext(db, s) {
     }
   }
 
+  // 质量隔离：批次当前是否受生效隔离令控制（隔离期间只能登记召回）。
+  ctx.quarantine_hits = s.batch_id == null
+    ? []
+    : require('./quarantine').controlledHitsForBatch(db, s.batch_id);
+  ctx.quarantined = ctx.quarantine_hits.length > 0;
+  ctx.quarantine_orders = ctx.quarantine_hits.map((h) => ({
+    order_id: h.order_id,
+    order_code: h.order_code,
+    classification: h.classification,
+    reason: h.reason,
+    issued_at: h.issued_at
+  }));
+
   const rollIds = db.prepare(
     'SELECT DISTINCT roll_id FROM shipment_items WHERE shipment_id = ?'
   ).all(s.id).map((r) => r.roll_id);
@@ -185,6 +200,8 @@ function buildContext(db, s) {
       status: roll.status,
       retired: roll.status === 'RETIRED',
       retired_reason: roll.retired_reason || '',
+      suspended: !!(roll.suspended && roll.status === 'ACTIVE'),
+      suspended_reason: roll.suspended ? (roll.suspended_reason || '') : '',
       release_id: roll.release_id,
       release_exists: !!release,
       release_active: !!(release && release.status === 'ACTIVE'),
@@ -200,7 +217,7 @@ function buildContext(db, s) {
   ctx.snapshot_covers_current = ctx.batch_produced && ctx.uncovered_allergens.length === 0;
   ctx.has_active_release = ctx.active_releases.length > 0;
   ctx.can_continue = ctx.batch_exists && ctx.batch_produced &&
-    ctx.has_active_release && ctx.snapshot_covers_current;
+    ctx.has_active_release && ctx.snapshot_covers_current && !ctx.quarantined;
   return ctx;
 }
 
@@ -218,10 +235,18 @@ function contextHash(ctx) {
       missing: !!r.missing,
       status: r.status || null,
       retired_reason: r.retired_reason || '',
+      suspended: !!r.suspended,
+      suspended_reason: r.suspended_reason || '',
       release_id: r.release_id == null ? null : r.release_id,
       release_exists: !!r.release_exists,
       release_active: !!r.release_active
-    })).sort((a, b) => a.roll_id - b.roll_id)
+    })).sort((a, b) => a.roll_id - b.roll_id),
+    // 隔离受控状态/生效令集合变化也使旧结论需要重新评估。
+    quarantined: ctx.quarantined,
+    quarantine_orders: (ctx.quarantine_orders || []).map((h) => ({
+      order_id: h.order_id,
+      classification: h.classification
+    })).sort((a, b) => a.order_id - b.order_id)
   };
   return crypto.createHash('sha256').update(canonicalString(payload)).digest('hex');
 }
@@ -242,6 +267,13 @@ function continueBlockers(ctx) {
   }
   if (ctx.batch_exists && !ctx.has_active_release) {
     blockers.push('当前没有有效放行记录，不允许准予继续流转，只能召回');
+  }
+  if (ctx.quarantined) {
+    const codes = [...new Set((ctx.quarantine_orders || []).map((h) => h.order_code))].join('、');
+    blockers.push(
+      `该批次当前受质量隔离令${codes ? `（${codes}）` : ''}控制，隔离期间只能登记召回（RECALL）；` +
+      '解除隔离或批次脱离全部生效令后才可重新评估准予继续流转'
+    );
   }
   return blockers;
 }
@@ -311,12 +343,17 @@ function getEvaluation(db, idOrCode) {
       batch_code: ctx.batch_code,
       batch_allergens: ctx.batch_allergens,
       active_releases: ctx.active_releases,
-      used_rolls: ctx.used_rolls
+      used_rolls: ctx.used_rolls,
+      // 当前质量隔离状态（隔离期间只能召回）。
+      quarantined: ctx.quarantined,
+      quarantine_orders: ctx.quarantine_orders
     },
     conditions: {
       batch_exists: ctx.batch_exists && ctx.batch_produced,
       has_active_release: ctx.has_active_release,
       snapshot_covers_current: ctx.snapshot_covers_current,
+      not_quarantined: !ctx.quarantined,
+      quarantined: ctx.quarantined,
       uncovered_allergens: ctx.uncovered_allergens,
       can_continue: ctx.can_continue,
       only_recall: !ctx.can_continue,
@@ -427,10 +464,15 @@ function submitDisposition(db, idOrCode, body) {
       batch_allergens: ctx.batch_allergens,
       snapshot_allergens: ctx.snapshot_allergens,
       active_release_ids: ctx.active_releases.map((r) => r.id),
+      quarantined: ctx.quarantined,
+      quarantine_orders: (ctx.quarantine_orders || []).map((h) => ({
+        order_id: h.order_id, classification: h.classification
+      })),
       used_rolls: ctx.used_rolls.map((r) => ({
         roll_id: r.roll_id, roll_code: r.roll_code, status: r.status,
         retired_reason: r.retired_reason, release_id: r.release_id,
-        release_exists: r.release_exists, release_active: r.release_active
+        release_exists: r.release_exists, release_active: r.release_active,
+        suspended: !!r.suspended, suspended_reason: r.suspended_reason || ''
       }))
     };
 
@@ -488,6 +530,22 @@ function diffStaleReason(prev, ctx) {
     reasons.push(`有效放行发生变化（${pr.join('；')}）`);
   }
 
+  const prevQuarantine = !!(prev.quarantined ||
+    (prev.quarantine_orders || []).length > 0);
+  const prevQOrders = new Map((prev.quarantine_orders || []).map((h) => [h.order_id, h]));
+  const curQOrders = new Map((ctx.quarantine_orders || []).map((h) => [h.order_id, h]));
+  if (prevQuarantine !== ctx.quarantined ||
+      [...prevQOrders.keys()].join(',') !== [...curQOrders.keys()].join(',')) {
+    if (ctx.quarantined) {
+      reasons.push(
+        `批次已受质量隔离令控制（${[...curQOrders.values()].map((h) => h.order_code).join('、') || '生效令'}），` +
+        '隔离期间只能召回'
+      );
+    } else {
+      reasons.push('批次已脱离全部生效质量隔离令，原结论需重新评估（不自动恢复）');
+    }
+  }
+
   const prevRolls = new Map((prev.used_rolls || []).map((r) => [r.roll_id, r]));
   for (const cur of ctx.used_rolls) {
     const before = prevRolls.get(cur.roll_id);
@@ -496,12 +554,22 @@ function diffStaleReason(prev, ctx) {
       continue;
     }
     const becameRetired = before.status === 'ACTIVE' && cur.status === 'RETIRED';
+    const becameSuspended = !before.suspended && cur.suspended;
+    const becameResumed = !!before.suspended && !cur.suspended;
     const relChanged = before.release_active !== cur.release_active ||
       before.release_exists !== cur.release_exists;
     if (becameRetired) {
       reasons.push(`所用卷 ${cur.roll_code} 已停用：${cur.retired_reason || '标签卷已永久停用'}`);
     } else if (cur.status === 'RETIRED' && before.retired_reason !== cur.retired_reason) {
       reasons.push(`所用卷 ${cur.roll_code} 停用原因已更新：${cur.retired_reason}`);
+    } else if (becameSuspended) {
+      reasons.push(
+        `所用卷 ${cur.roll_code} 已因质量隔离暂停贴用（不永久停用）：${cur.suspended_reason || '批次受控'}`
+      );
+    } else if (becameResumed) {
+      reasons.push(`所用卷 ${cur.roll_code} 已随隔离解除恢复贴用，原结论需重新评估（不自动恢复）`);
+    } else if (cur.suspended && before.suspended_reason !== cur.suspended_reason) {
+      reasons.push(`所用卷 ${cur.roll_code} 的隔离暂停原因已更新：${cur.suspended_reason}`);
     } else if (relChanged) {
       reasons.push(
         `所用卷 ${cur.roll_code} 绑定放行状态变化（${cur.release_active ? '恢复有效' : '已失效或删除'}）`

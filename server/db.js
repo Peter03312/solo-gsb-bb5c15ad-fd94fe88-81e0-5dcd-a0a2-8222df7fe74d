@@ -249,6 +249,41 @@ function initSchema(d) {
   --   事件新增/更正、断网补录、换线预演与确认应用均按最终设备与时间核对窗口
   --   （见 validation.js 全量校验）。
   --   停机不等于清洗：窗口不是事件，不改变设备残留或过敏原推导，不触发重算联动。
+  -- 质量隔离令（质检针对“已登记的原料供应批号”签发/解除）：
+  --   status='ACTIVE' 生效中 / 'RELEASED' 已解除（记录只增不改，解除即置终态留痕）；
+  --   同一批号同时只能有一张生效令（部分唯一索引 idx_active_order_per_lot 强制）。
+  --   生效范围不持久化在本表：见 quarantine_order_scope（每次重算/签发/解除后整表刷新）。
+  CREATE TABLE IF NOT EXISTS quarantine_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_code TEXT NOT NULL UNIQUE,      -- 令号，如 QUAR-0001（签发事务内补发）
+    material_id INTEGER NOT NULL REFERENCES materials(id),
+    material_lot_id INTEGER NOT NULL REFERENCES material_lots(id), -- 必须是已登记批号（不支持“批号未知”）
+    reason TEXT NOT NULL DEFAULT '',      -- 签发原因
+    issued_by TEXT NOT NULL DEFAULT '',   -- 签发操作人
+    issued_at TEXT NOT NULL,              -- 签发时间
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','RELEASED')),
+    released_reason TEXT NOT NULL DEFAULT '', -- 解除原因
+    released_by TEXT NOT NULL DEFAULT '',     -- 解除操作人
+    released_at TEXT,                         -- 解除时间
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 隔离令生效范围（派生数据）：签发时与每次“原料资料/事件更正、补录、换线或清洗”
+  -- 重算后整表重建。一行 = 一张生效令命中的一个产出批次（含确定命中/批号未知无法排除
+  -- 两类分类与传播依据 JSON）。批次脱离全部生效令后其行随之消失，即解除受控。
+  CREATE TABLE IF NOT EXISTS quarantine_order_scope (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES quarantine_orders(id) ON DELETE CASCADE,
+    batch_id INTEGER NOT NULL,            -- 不加外键：批次可能连带删除（行随之整表重建消失）
+    batch_code TEXT NOT NULL DEFAULT '',
+    -- CONFIRMED=确定命中（该批号直接投料可核实传播链）；
+    -- UNRESOLVED=因该原料批号未知而无法排除。两类都受控。
+    classification TEXT NOT NULL CHECK (classification IN ('CONFIRMED','UNRESOLVED')),
+    evidence_json TEXT NOT NULL DEFAULT '{}', -- 传播依据（链 + routes，展示用）
+    refreshed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (order_id, batch_id)
+  );
+
   CREATE TABLE IF NOT EXISTS equipment_downtime_windows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     equipment_id INTEGER NOT NULL REFERENCES equipment(id),
@@ -278,6 +313,12 @@ function initSchema(d) {
   -- 故不加全局唯一约束；“同号不同内容整包拒绝”在提交校验中按首次出现记录比对哈希强制。
   CREATE INDEX IF NOT EXISTS idx_backfill_records_external ON backfill_records(external_ref);
   CREATE INDEX IF NOT EXISTS idx_downtime_windows_equipment ON equipment_downtime_windows(equipment_id);
+  -- 同一供应批号同时只能有一张生效隔离令（已解除的历史令不参与唯一约束）。
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_active_order_per_lot
+    ON quarantine_orders(material_lot_id) WHERE status = 'ACTIVE';
+  CREATE INDEX IF NOT EXISTS idx_quarantine_orders_status ON quarantine_orders(status, id);
+  CREATE INDEX IF NOT EXISTS idx_quarantine_scope_order ON quarantine_order_scope(order_id);
+  CREATE INDEX IF NOT EXISTS idx_quarantine_scope_batch ON quarantine_order_scope(batch_id);
   `);
 
   // ---- 旧库迁移（CREATE TABLE IF NOT EXISTS 不会为既有表补列）----
@@ -295,6 +336,17 @@ function initSchema(d) {
   const eventCols = d.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
   if (!eventCols.includes('clean_allergens')) {
     d.exec('ALTER TABLE events ADD COLUMN clean_allergens TEXT');
+  }
+
+  // label_rolls.suspended/suspended_reason：质量隔离令对标签卷的“暂停贴用”。
+  //   与永久停用（status='RETIRED'，终态）不同：暂停可逆，批次脱离全部生效令后恢复贴用；
+  //   已永久停用的卷不暂停（RETIRED 即终态），暂停期间卷仍为 ACTIVE，但不可核销贴用/出货。
+  const rollCols = d.prepare('PRAGMA table_info(label_rolls)').all().map((c) => c.name);
+  if (!rollCols.includes('suspended')) {
+    d.exec('ALTER TABLE label_rolls ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!rollCols.includes('suspended_reason')) {
+    d.exec("ALTER TABLE label_rolls ADD COLUMN suspended_reason TEXT NOT NULL DEFAULT ''");
   }
 }
 

@@ -65,6 +65,16 @@ function registerRoll(db, body) {
   const ev = db.prepare('SELECT id FROM events WHERE batch_id = ?').get(batch_id);
   if (!out || !ev) throw new LabelError('BATCH_NOT_PRODUCED', '该批次尚无加工记录，无法登记标签卷');
 
+  // 受控批次不得登记标签卷（质量隔离期间整次拒绝）。
+  try {
+    require('./quarantine').assertBatchNotControlled(db, batch_id, '登记标签卷');
+  } catch (err) {
+    if (err && err.name === 'QuarantineError') {
+      throw new LabelError('BATCH_QUARANTINED', err.message, err.details);
+    }
+    throw err;
+  }
+
   const release = db.prepare(
     'SELECT id, batch_id, status, snapshot_allergens FROM releases WHERE id = ?'
   ).get(release_id);
@@ -118,6 +128,14 @@ function consumeRoll(db, id, body) {
       'ROLL_RETIRED',
       `该卷已永久停用（${roll.retired_reason || '见停用原因'}），余量不可再贴；已贴数量待复核`,
       [roll.retired_reason]
+    );
+  }
+  if (roll.suspended) {
+    throw new LabelError(
+      'ROLL_SUSPENDED',
+      `该卷因质量隔离暂停贴用（${roll.suspended_reason || '批次受控'}）：已有卷暂停贴用但不永久停用，` +
+      '隔离解除或批次脱离全部生效令后自动恢复',
+      [roll.suspended_reason]
     );
   }
   const expected_revision = parseInt(body && body.expected_revision, 10);
@@ -288,7 +306,10 @@ function formatRoll(r) {
     status: r.status,
     active: r.status === 'ACTIVE',
     retired_reason: r.retired_reason || '',
-    applied_pending_review: r.status === 'RETIRED' ? applied : 0
+    applied_pending_review: r.status === 'RETIRED' ? applied : 0,
+    // 质量隔离暂停（可逆；与永久停用 RETIRED 相互独立）：暂停时仍为 ACTIVE 但不可贴用/出货。
+    suspended: !!(r.suspended && r.status === 'ACTIVE'),
+    suspended_reason: r.suspended ? (r.suspended_reason || '') : ''
   };
 }
 

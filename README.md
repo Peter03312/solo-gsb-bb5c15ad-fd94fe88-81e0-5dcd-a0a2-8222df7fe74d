@@ -16,6 +16,12 @@
 **设备检修停机窗口**按设备登记/调整/取消（起止时间、原因、操作人；左闭右开、同设备不重叠、相邻允许）：
 **检修期间不能记录加工或清洗**——登记/调整窗口覆盖已有事件、或在窗口内新增/更正事件、断网补录、
 换线预演与确认，均按最终设备和时间核对并整次拒绝；**停机不等于清洗**，不改变设备残留或过敏原推导。
+质检员可对**已登记的原料供应批号签发/解除质量隔离令**（记录原因、操作人与时间；同一批号同时只能有一张生效令，
+批号原有 FLAGGED 异常标记仍只作留痕）：生效范围按**当前事件时间线**的批号流向确定，
+**确定命中与因批号未知无法排除的批次都受控**并展示传播依据，原料资料/事件更正、补录、换线或清洗后自动同步刷新；
+受控批次**不得登记放行、标签卷或确认出货**，已有标签卷**暂停贴用但不永久停用**（脱离全部生效令后自动恢复），
+关联已出货单转**待评估**（隔离期间只能召回），有效的继续流转结论转**需重评**；解除或流向变化使批次脱离全部生效令后才恢复后续操作，
+**待评估单及历史处置不自动恢复**。
 
 - 后端：Node.js + Express
 - 数据库：SQLite（[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)，数据文件本地保存）
@@ -1004,6 +1010,142 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
 | 换线预演/确认命中窗口 | 400 | `REPLAN_REJECTED` |
 | 窗口变动后确认旧预演版本 | 409 | `VERSION_EXPIRED` |
 
+## 质量隔离令（本轮新增）
+
+质检员对**已登记的原料供应批号**签发或解除质量隔离令；系统按当前事件时间线自动确定受控范围并联动业务状态。
+
+### 规则
+
+- **签发/解除均留痕**：记录原因、操作人与时间；隔离令记录只增不改（解除即置 `RELEASED` 终态）。
+  同一批号**同时只能有一张生效令**——重复签发 `409 QUARANTINE_ORDER_EXISTS`、重复解除
+  `409 QUARANTINE_ORDER_ALREADY_RELEASED`；批号不存在明确拒绝（`404 LOT_NOT_FOUND`）。
+- **原有 FLAGGED 异常标记仍只作留痕**：flag 不自动产生隔离令，隔离令也不改变 flag，二者互不影响。
+  隔离令只能针对**已登记批号**；“批号未知”不能单独签令（无登记批号可挂）。
+- **生效范围按当前事件时间线的批号流向确定**（与“原料批号追溯”同一套逐时传播规则）：
+  - **确定命中（CONFIRMED）**：该批号直接投料经直接投料/前序批次引用/同设备残留可核实传播到的批次；
+  - **因批号未知无法排除（UNRESOLVED）**：该原料批号未知投料传播到的批次。
+    **两类都受控**，每个批次给出传播依据链与传播方式（直接投料/前序引用/设备残留）及关联出货单；
+    全清截断全部设备残留，部分清洗按来源原料过敏原逐项截断（同追溯规则）。
+  - 范围不持久化在写入侧：**原料资料或事件更正、断网补录、整组换线确认、清洗调整后随重算自动同步刷新**。
+- **受控批次的业务限制**（写入侧守卫明确拒绝，`409 BATCH_QUARANTINED`）：
+  - 不得**登记放行**；
+  - 不得**登记标签卷**；
+  - 不得**确认出货**。
+- **已有标签卷暂停贴用但不永久停用**：受控批次名下仍有效的卷置 `suspended`（可逆，非 RETIRED）——
+  核销贴用/作废返回 `409 ROLL_SUSPENDED`（修订号不前进、数量不变），可出货余额为 0、不得再出货；
+  解除隔离或流向变化使批次**脱离全部生效令后自动恢复**贴用（已永久停用的 RETIRED 卷不恢复）。
+- **关联已出货单转待评估**：受控批次名下 `SHIPPED` 出货单自动置 `PENDING_REVIEW`（终态不自动恢复）；
+  评估视图增加“**当前未受隔离**”条件，**隔离期间只能登记召回（RECALL）**，提交 CONTINUE 返回
+  `409 CONTINUE_NOT_ALLOWED`。
+- **有效的继续流转结论转需重评**：隔离状态变化使仍为 ACTIVE 的处置结论标 `STALE`（旧结论保留、不自动生效）。
+- **解除或流向变化使批次脱离所有生效令后**才恢复放行/标签卷/出货登记与卷贴用；
+  **待评估出货单及历史处置结论不自动恢复**。
+- **签发、解除、范围变化与关联业务状态更新在一次事务内原子完成**（卷暂停/恢复、出货单转待评估、结论需重评）。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/quarantine-orders` | 签发隔离令：body `{ lot_id }` 或 `{ material_id, lot_code }` + `reason`/`issued_by`/`issued_at?`；返回令详情（含范围、传播依据、本次联动 `effects`） |
+| `GET /api/quarantine-orders` | 列表，可 `?status=ACTIVE|RELEASED`、`?material_id=`、`?lot_id=`；生效令附范围摘要 |
+| `GET /api/quarantine-orders/:idOrCode` | 单张令（数字 id 或 `QUAR-0001` 令号）：含确定命中/无法排除批次、传播依据、关联出货单与设备残留 |
+| `POST /api/quarantine-orders/:idOrCode/release` | 解除：body `{ reason, released_by, released_at? }`；原子刷新范围/恢复卷/旧结论需重评 |
+| `POST /api/releases`、`POST /api/label-rolls`、`POST /api/shipments` | 请求/响应形状不变；受控批次新增 `409 BATCH_QUARANTINED` 拒绝 |
+| `POST /api/label-rolls/:id/consume` | 请求不变；暂停卷新增 `409 ROLL_SUSPENDED`（不前进修订号） |
+| 事件 `POST/PUT/DELETE`、原料 `PUT`、补录、换线 `apply` | 响应形状不变，另附 `suspended_rolls`（本次新暂停卷）与 `resumed_rolls`（本次恢复卷） |
+| 换线 `preview` 的 `diff` | 另含 `quarantine_scope`、`rolls_will_suspend`、`rolls_will_resume` 及对应 `summary` 计数 |
+| `GET /api/state` | 顶层另含 `quarantine_orders`；批次另附 `quarantined`/`quarantine_hits`；标签卷另附 `suspended`/`suspended_reason` |
+| `GET /api/shipments/...`、余额接口 | 出货单另附 `quarantined`/`quarantine_orders`；余额另附 `quarantined`，逐卷另附 `suspended`（暂停卷 `available_qty=0`） |
+| 出货评估视图/处置 | 评估视图 `conditions` 另含 `quarantined`/`not_quarantined`，`current_state` 另含 `quarantine_orders`；隔离期间 CONTINUE 拒绝 |
+
+令号从 `QUAR-0001` 起。令对象主要字段：`order_code`、`material`、`lot`（含批号 `flagged` 状态）、
+`reason`/`issued_by`/`issued_at`、`status`/`active`、`released_*`、
+`scope.{controlled_batch_count, confirmed_batches[], unresolved_batches[], shipments}`、
+`equipment_residue[]`；签发/解除响应另附 `effects.{suspended_rolls, resumed_rolls, pending_shipments, stale_dispositions}`。
+
+### 调用示例（curl，基于演示数据）
+
+演示库中 `SUP-MILK-20260926-B`（全脂奶粉，已 FLAGGED）在 `BATCH-002`(10:00) 直接投料，
+经前序引用与设备残留传播到 `BATCH-003`(11:00)；`LABEL-0001`/`SHIP-0001` 属于 `BATCH-003`。
+
+```bash
+# 1) 签发隔离令（同批号已有生效令 -> 409 QUARANTINE_ORDER_EXISTS）
+curl -s -X POST http://localhost:3000/api/quarantine-orders \
+  -H 'Content-Type: application/json' -d '{
+    "lot_id": 2,
+    "reason": "供应商通报该批混入异常原料，立即隔离",
+    "issued_by": "质检员-陈静"
+  }'
+# -> { order_code:"QUAR-0001", status:"ACTIVE",
+#      scope:{ controlled_batch_count:2,
+#        confirmed_batches:[{batch_code:"BATCH-002", classification:"CONFIRMED",
+#          evidence:{chains:["原料:全脂奶粉(MILK-01)[批号:SUP-MILK-20260926-B]"], routes:{...}}},
+#         {batch_code:"BATCH-003", evidence:{chains:[...批次引用...,...设备残留...],
+#          shipments:[{shipment_code:"SHIP-0001", status:"PENDING_REVIEW", ...}]}}],
+#        unresolved_batches:[] },
+#      effects:{ suspended_rolls:[{roll_code:"LABEL-0001", reason:"...暂停贴用但不永久停用..."}],
+#                resumed_rolls:[], pending_shipments:[{shipment_code:"SHIP-0001",...}],
+#                stale_dispositions:[] } }
+
+# 2) 受控期间：登记放行 / 标签卷 / 出货一律拒绝；暂停卷核销拒绝（修订号不前进）
+curl -s -X POST http://localhost:3000/api/releases -H 'Content-Type: application/json' \
+  -d '{"batch_id":2,"released_at":"2026-10-01T09:00","released_by":"w"}'
+# -> 409 { code:"BATCH_QUARANTINED", error:"该批次当前受 1 张质量隔离令控制，登记放行在隔离期间不允许…",
+#          details:["隔离令 QUAR-0001（确定命中：供应商通报…）"] }
+curl -s -X POST http://localhost:3000/api/label-rolls/1/consume -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"applied":1,"voided":0,"used_by":"赵强"}'
+# -> 409 { code:"ROLL_SUSPENDED", error:"该卷因质量隔离暂停贴用（…）：已有卷暂停贴用但不永久停用…" }
+
+# 3) 关联已出货单转待评估；隔离期间评估只能召回（CONTINUE 被拒）
+curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation
+# -> conditions:{ quarantined:true, not_quarantined:false, can_continue:false, only_recall:true,
+#                 blockers:["该批次当前受质量隔离令（QUAR-0001）控制，隔离期间只能登记召回（RECALL）…"] }
+VER=$(curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation \
+  | node -pe 'JSON.parse(require("fs").readFileSync(0)).version')
+curl -s -X POST http://localhost:3000/api/shipments/SHIP-0001/dispositions \
+  -H 'Content-Type: application/json' \
+  -d "{\"decision\":\"RECALL\",\"decided_by\":\"质检员-陈静\",\"basis\":\"牛奶批号隔离，整批召回\",\"version\":\"$VER\"}"
+
+# 4) 因批号未知无法排除的批次同样受控：对该原料下“未直接投料的另一已登记批号”签令
+#    （全蛋液批号未知投料在 BATCH-002 → BATCH-003；范围列入 unresolved_batches 并给依据）
+curl -s -X POST http://localhost:3000/api/quarantine-orders -H 'Content-Type: application/json' -d '{
+  "material_id":4,"lot_code":"SUP-EGG-20260926-X",
+  "reason":"蛋粉供应商通报同线异常","issued_by":"陈静"}'
+# -> scope:{ confirmed_batches:[], unresolved_batches:[
+#      {batch_code:"BATCH-002", evidence:{chains:["原料:全蛋液(EGG-01)[批号未知]"]}},
+#      {batch_code:"BATCH-003", ...} ] }
+
+# 5) 解除：范围按最新时间线重建；卷恢复贴用；待评估单与历史召回不自动恢复（旧结论转需重评）
+curl -s -X POST http://localhost:3000/api/quarantine-orders/QUAR-0001/release \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"供应商复检合格，解除隔离","released_by":"质检员-陈静"}'
+# -> { status:"RELEASED", scope:{controlled_batch_count:0,...},
+#      effects:{ resumed_rolls:[{roll_code:"LABEL-0001"}], pending_shipments:[],
+#                stale_dispositions:[{decision:"RECALL", reason:"批次已脱离全部生效质量隔离令…"}] } }
+#    SHIP-0001 仍为 PENDING_REVIEW；其召回结论 life_status:"STALE"（需重新评估，不自动生效）。
+
+# 6) 范围随流向变化自动刷新：更正/补录/换线/清洗后重算，批次脱离全部生效令即恢复。
+#    事件写入响应平铺新字段：
+# -> POST /api/events -> { ..., suspended_rolls:[...], resumed_rolls:[...] }
+#    换线预演（不写正式数据）预测应用后的范围与暂停：
+# -> POST /api/replan/preview -> diff.quarantine_scope / diff.rolls_will_suspend / rolls_will_resume
+
+# 7) 列表/查询
+curl -s 'http://localhost:3000/api/quarantine-orders?status=ACTIVE'
+curl -s http://localhost:3000/api/quarantine-orders/QUAR-0001
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 缺批号/缺原因/缺操作人/时间格式错/`lot_id` 与 `lot_code` 同传 | 400 | `INVALID_REQUEST` |
+| 批号或原料不存在 | 404 | `LOT_NOT_FOUND` / `MATERIAL_NOT_FOUND` |
+| 隔离令不存在（查询/解除） | 404 | `QUARANTINE_ORDER_NOT_FOUND` |
+| 同一批号重复签发 | 409 | `QUARANTINE_ORDER_EXISTS` |
+| 重复解除 | 409 | `QUARANTINE_ORDER_ALREADY_RELEASED` |
+| 受控批次登记放行/标签卷/出货 | 409 | `BATCH_QUARANTINED` |
+| 暂停卷核销贴用/作废 | 409 | `ROLL_SUSPENDED` |
+| 隔离期间提交 CONTINUE | 409 | `CONTINUE_NOT_ALLOWED` |
+
 ## 一键启动（Docker，从空环境开始）
 
 要求安装 Docker 与 Docker Compose（v2）。在项目目录执行：
@@ -1046,6 +1188,7 @@ npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯
 npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清指定过敏原/重算联动（放行/卷/出货/处置）/追溯按过敏原保留设备传播/全清与无过敏原原料/换线预演确认
 npm run test:backfill     # 端到端验证断网日志整包补录：整包事务/包内引用/幂等重试/外部记录号复用与冲突/重算联动（放行/卷/出货/处置）/对账（OK/MISMATCH/DELETED）/旧接口兼容
 npm run test:downtime     # 端到端验证设备检修停机窗口：登记/调整/取消/查询、左闭右开与相邻允许、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗
+npm run test:quarantine   # 端到端验证质量隔离令：签发/重复签发/重复解除拒绝、确定命中+批号未知无法排除范围与依据、受控守卫（放行/卷/出货）、卷暂停贴用不永久停用与恢复、已出货单待评估与隔离期只能召回、结论需重评、解除不自动恢复、更正/换线后范围刷新、多令重叠
 ```
 
 ## 访问地址与端口
@@ -1094,6 +1237,10 @@ npm run test:downtime     # 端到端验证设备检修停机窗口：登记/调
 - **检修停机**：按设备登记/调整/取消停机窗口（起止时间、原因、操作人），列表展示各窗口
   （左闭右开区间、冲突事件数）；登记或调整覆盖已有加工/清洗事件时整次拒绝并列出冲突事件；
   窗口内不能记录加工或清洗（停机不等于清洗，不改变设备残留或推导）。
+- **质量隔离令**：选择已登记的原料供应批号签发/解除隔离令（原因、操作人、时间），
+  页面展示每张令的**确定命中**与**因批号未知无法排除**批次、传播依据链与关联出货单；
+  受控批次在“批次与放行”页红色标注、受控标签卷显示“隔离暂停贴用”（不永久停用）；
+  解除或流向变化后自动刷新，待评估单与历史处置不自动恢复。
 - **原料与设备**：维护原料档案（编码、名称、过敏原标签）、设备档案与**原料供应批号**（登记/通报异常 FLAGGED/解除/删除）。
 
 ## 快速体验失效场景
@@ -1114,7 +1261,8 @@ server/
   db.js          # SQLite 连接与表结构（导出 initSchema 供内存影子库复用）
   validation.js  # 全量校验（未来批次/循环/时间冲突/重复产出/事件落入停机窗口）
   downtime.js    # 设备检修停机窗口：登记/调整/取消/查询（左闭右开、同设备不重叠相邻允许、覆盖事件整次拒绝）；事件落窗核对供全量校验复用
-  recompute.js   # 推导引擎：回放事件、批次并集、设备残留（全清/部分清洗按过敏原清除）、放行核对、标签卷停用核对、出货单待评估核对
+  quarantine.js  # 质量隔离令：签发/解除（同批号唯一生效令）、按当前时间线重建生效范围（确定命中+批号未知无法排除、传播依据）、受控守卫、卷暂停/恢复、已出货单转待评估
+  recompute.js   # 推导引擎：回放事件、批次并集、设备残留（全清/部分清洗按过敏原清除）、放行核对、标签卷停用核对、出货单待评估核对、质量隔离令范围重建与暂停/恢复联动
   labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
   shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额、待评估联动（不自动恢复）
   evaluation.js  # 待评估单质量处置：评估视图、签名状态版本、整单结论事务提交、旧结论需重评核对
@@ -1123,7 +1271,7 @@ server/
   backfill.js    # 断网日志整包补录：有序记录（外部记录号/时间/设备，加工含产出批次/原料批号可未知/引用批次，清洗省略范围=全清非空=部分）；整包事务校验+重算；同批号同内容幂等、同号复用/冲突拒绝；补录批号对账（OK/MISMATCH/DELETED）
   replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号）
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单、两个相邻检修停机窗口）
-  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账、/api/downtime-windows 停机窗口）
+  server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions、/api/backfills 补录与对账、/api/downtime-windows 停机窗口、/api/quarantine-orders 质量隔离令签发/解除与范围）
 public/
   index.html  styles.css  app.js
 scripts/
@@ -1136,5 +1284,6 @@ scripts/
   test-partial-clean.js # 部分清洗：入参校验/部分清除推导/重算联动/追溯过敏原级截断/换线预演确认 端到端测试
   test-backfill.js   # 断网日志整包补录：整包事务/包内引用/幂等/外部记录号复用与冲突/重算联动/对账/旧接口兼容 端到端测试
   test-downtime.js   # 设备检修停机窗口：登记/调整/取消/查询、重叠与相邻、覆盖事件整次拒绝、事件/补录/换线核对、幂等重试优先、停机不等于清洗 端到端测试
+  test-quarantine.js # 质量隔离令：签发/解除拒绝、确定命中+无法排除范围与依据、受控守卫、卷暂停/恢复、待评估与只能召回、结论需重评、范围随更正/换线刷新、多令重叠 端到端测试
 Dockerfile  docker-compose.yml
 ```

@@ -318,3 +318,18 @@ li.trace-trunc { color: #888; list-style: none; margin-left: -16px; }
 .clean-mode-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-weight: normal; }
 #evCleanAllergens { margin-top: 6px; width: 100%; }
 .event-item.clean { border-left: 3px solid var(--accent, #4f7cc7); }
+
+/* ===== 质量隔离令 ===== */
+.badge.danger { background: var(--danger); color: #fff; }
+.badge.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid #e8d29a; }
+.hidden { display: none !important; }
+.quarantine-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.quarantine-card { border: 1px solid #e3b3ac; border-radius: 8px; padding: 10px 12px; background: #fdf3f2; }
+.quarantine-card.released { border-color: #d8d8d8; background: #fafafa; }
+.quarantine-banner {
+  margin: 6px 0; padding: 5px 10px; border-radius: 6px; font-size: 12.5px;
+  background: var(--danger-bg); color: var(--danger); border: 1px solid #e3b3ac;
+}
+.batch-card.quarantined { border-color: #e3b3ac; box-shadow: inset 3px 0 0 var(--danger); }
+.roll-card.suspended { border-color: #e8d29a; box-shadow: inset 3px 0 0 var(--warn); }
+.quarantine-detail { margin-top: 8px; border-top: 1px dashed #e3b3ac; padding-top: 8px; }

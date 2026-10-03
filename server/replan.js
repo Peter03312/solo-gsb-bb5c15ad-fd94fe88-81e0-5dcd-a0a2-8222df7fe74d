@@ -374,6 +374,12 @@ const FINGERPRINT_SQL = [
           context_snapshot, status_version, life_status, stale_reason, decided_at
      FROM shipment_dispositions ORDER BY id`,
   `SELECT shipment_id, version FROM shipment_versions ORDER BY shipment_id`,
+  // 质量隔离令与生效范围、标签卷暂停状态纳入指纹：签发/解除隔离令后旧预演版本过期。
+  `SELECT id, order_code, material_id, material_lot_id, reason, issued_by, issued_at,
+          status, released_reason, released_by, released_at, created_at
+     FROM quarantine_orders ORDER BY id`,
+  `SELECT id, order_id, batch_id, batch_code, classification, evidence_json, refreshed_at
+     FROM quarantine_order_scope ORDER BY id`,
   // 停机窗口同样纳入指纹：窗口登记/调整/取消后，旧预演版本过期，确认应用须重新预演核对。
   `SELECT id, equipment_id, start_time, end_time, reason, operator, created_at, updated_at
      FROM equipment_downtime_windows ORDER BY id`
@@ -679,7 +685,7 @@ function openShadow(sourceDb) {
   copy('batch_outputs', 'batch_id,allergens,paths_json');
   copy('equipment_residue', 'equipment_id,allergens,paths_json,last_cleaned_at');
   copy('releases', 'id,batch_id,released_at,released_by,snapshot_allergens,status,invalid_reason,created_event_seq');
-  copy('label_rolls', 'id,roll_code,batch_id,release_id,print_qty,applied_qty,void_qty,revision,allergen_set,registered_at,registered_by,status,retired_reason');
+  copy('label_rolls', 'id,roll_code,batch_id,release_id,print_qty,applied_qty,void_qty,revision,allergen_set,registered_at,registered_by,status,retired_reason,suspended,suspended_reason');
   copy('label_roll_usages', 'id,roll_id,used_at,applied_qty,void_qty,expected_revision,used_by');
   copy('shipments', 'id,shipment_code,batch_id,batch_code,ship_qty,allergen_set,status,review_reason,shipped_at,shipped_by,created_at');
   copy('shipment_items', 'id,shipment_id,roll_id,roll_code,release_id,release_at,release_by,allergen_set,roll_revision,qty');
@@ -687,6 +693,9 @@ function openShadow(sourceDb) {
   copy('shipment_versions', 'shipment_id,version');
   // 停机窗口一并拷入影子库：预演按整组变更后的最终设备与时间核对窗口（不写正式数据）。
   copy('equipment_downtime_windows', 'id,equipment_id,start_time,end_time,reason,operator,created_at,updated_at');
+  // 质量隔离令与生效范围一并拷入：recompute(shadow) 会按影子库时间线重建范围并重算暂停/待评估。
+  copy('quarantine_orders', 'id,order_code,material_id,material_lot_id,reason,issued_by,issued_at,status,released_reason,released_by,released_at,created_at');
+  copy('quarantine_order_scope', 'id,order_id,batch_id,batch_code,classification,evidence_json,refreshed_at');
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
@@ -757,6 +766,42 @@ function simulate(db, changes) {
     diff.summary.shipments_will_pending = pendingShipments.length;
     diff.dispositions_will_stale = staleDispositions;
     diff.summary.dispositions_will_stale = staleDispositions.length;
+
+    // 质量隔离令范围变化预测：影子库重算后生效范围与卷暂停（可逆，不停用）。
+    const scopeRows = shadow.prepare(
+      `SELECT qos.batch_id, b.code AS batch_code, qos.classification, qo.order_code
+         FROM quarantine_order_scope qos
+         LEFT JOIN batches b ON b.id = qos.batch_id
+         JOIN quarantine_orders qo ON qo.id = qos.order_id
+        ORDER BY qo.id, qos.batch_id`
+    ).all();
+    diff.quarantine_scope = scopeRows;
+    diff.summary.quarantine_controlled_batches =
+      new Set(scopeRows.map((r) => r.batch_id)).size;
+    diff.rolls_will_suspend = shadow.prepare(
+      `SELECT lr.id, lr.roll_code, b.code AS batch_code, lr.suspended_reason
+         FROM label_rolls lr LEFT JOIN batches b ON b.id = lr.batch_id
+        WHERE lr.suspended = 1 AND lr.status = 'ACTIVE'`
+    ).all()
+      .filter((r) => {
+        const real = db.prepare('SELECT suspended, status FROM label_rolls WHERE id = ?').get(r.id);
+        return real && real.status === 'ACTIVE' && !real.suspended;
+      })
+      .map((r) => ({
+        roll_id: r.id, roll_code: r.roll_code, batch_code: r.batch_code,
+        reason: r.suspended_reason
+      }));
+    diff.rolls_will_resume = db.prepare(
+      `SELECT id, roll_code FROM label_rolls
+        WHERE suspended = 1 AND status = 'ACTIVE' ORDER BY id`
+    ).all()
+      .filter((r) => {
+        const after = shadow.prepare('SELECT suspended, status FROM label_rolls WHERE id = ?').get(r.id);
+        return after && after.status === 'ACTIVE' && !after.suspended;
+      })
+      .map((r) => ({ roll_id: r.id, roll_code: r.roll_code }));
+    diff.summary.rolls_will_suspend = diff.rolls_will_suspend.length;
+    diff.summary.rolls_will_resume = diff.rolls_will_resume.length;
     return { resolved, inserted, after, diff };
   } finally {
     shadow.close();
@@ -818,7 +863,8 @@ function apply(db, body) {
     if (errors.length) {
       throw new ReplanError('REPLAN_REJECTED', '整组变更应用后的时间线校验未通过', errors);
     }
-    const { invalidated, retiredRolls, pendingShipments, staleDispositions } = recompute(db);
+    const { invalidated, retiredRolls, pendingShipments, staleDispositions,
+            suspendedRolls, resumedRolls } = recompute(db);
     const after = takeSnapshot(db);
     const appliedDiff = diffSnapshots(before, after);
     appliedDiff.label_rolls_will_retire = retiredRolls.map((r) => ({
@@ -832,6 +878,24 @@ function apply(db, body) {
     // 旧质量处置结论被标为需重新评估（只增不改，不自动生效）。
     appliedDiff.dispositions_will_stale = staleDispositions;
     appliedDiff.summary.dispositions_will_stale = staleDispositions.length;
+    // 质量隔离令：应用后生效范围与卷暂停/恢复（可逆，不永久停用）。
+    appliedDiff.quarantine_scope = db.prepare(
+      `SELECT qos.batch_id, b.code AS batch_code, qos.classification, qo.order_code
+         FROM quarantine_order_scope qos
+         LEFT JOIN batches b ON b.id = qos.batch_id
+         JOIN quarantine_orders qo ON qo.id = qos.order_id
+        ORDER BY qo.id, qos.batch_id`
+    ).all();
+    appliedDiff.summary.quarantine_controlled_batches =
+      new Set(appliedDiff.quarantine_scope.map((r) => r.batch_id)).size;
+    appliedDiff.rolls_will_suspend = suspendedRolls.map((r) => ({
+      roll_id: r.id, roll_code: r.roll_code, batch_code: r.batch_code, reason: r.reason
+    }));
+    appliedDiff.rolls_will_resume = resumedRolls.map((r) => ({
+      roll_id: r.id, roll_code: r.roll_code
+    }));
+    appliedDiff.summary.rolls_will_suspend = suspendedRolls.length;
+    appliedDiff.summary.rolls_will_resume = resumedRolls.length;
 
     // 提交后再计算一次指纹，作为新的业务版本随结果返回。
     response = {
@@ -843,6 +907,8 @@ function apply(db, body) {
       retired_rolls: retiredRolls,
       pending_shipments: pendingShipments,
       stale_dispositions: staleDispositions,
+      suspended_rolls: suspendedRolls,
+      resumed_rolls: resumedRolls,
       diff: appliedDiff
     };
   });

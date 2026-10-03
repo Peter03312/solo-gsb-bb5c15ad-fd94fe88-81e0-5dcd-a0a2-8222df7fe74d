@@ -70,6 +70,16 @@ function createShipment(db, body) {
   const batch = db.prepare('SELECT id, code FROM batches WHERE id = ?').get(batch_id);
   if (!batch) throw new ShipmentError('BATCH_NOT_FOUND', '出货批次不存在');
 
+  // 受控批次不得确认出货（质量隔离期间整单拒绝）。
+  try {
+    require('./quarantine').assertBatchNotControlled(db, batch_id, '确认出货');
+  } catch (err) {
+    if (err && err.name === 'QuarantineError') {
+      throw new ShipmentError('BATCH_QUARANTINED', err.message, err.details);
+    }
+    throw err;
+  }
+
   // 规范化并去重：同一卷在一张出货单中只能出现一次。
   const allocations = [];
   const seenRolls = new Set();
@@ -118,6 +128,14 @@ function createShipment(db, body) {
         [roll.retired_reason]
       );
     }
+    if (roll.suspended) {
+      throw new ShipmentError(
+        'ROLL_SUSPENDED',
+        `卷 ${roll.roll_code} 因质量隔离暂停贴用（不永久停用），隔离期间不得出货；` +
+        '解除隔离或批次脱离全部生效令后自动恢复',
+        [roll.suspended_reason]
+      );
+    }
     const release = roll.release_id == null ? null
       : db.prepare('SELECT id, status FROM releases WHERE id = ?').get(roll.release_id);
     if (!release) {
@@ -158,6 +176,13 @@ function createShipment(db, body) {
           'ROLL_RETIRED',
           `卷 ${roll.roll_code} 已永久停用，其标签不得再出货`,
           [roll.retired_reason]
+        );
+      }
+      if (roll.suspended) {
+        throw new ShipmentError(
+          'ROLL_SUSPENDED',
+          `卷 ${roll.roll_code} 因质量隔离暂停贴用（不永久停用），隔离期间不得出货`,
+          [roll.suspended_reason]
         );
       }
       const release = roll.release_id == null ? null
@@ -355,6 +380,11 @@ function formatShipment(s, db) {
       };
     }
   }
+  // 当前是否受质量隔离令控制（来自最新生效范围；待评估单不自动恢复，隔离状态仍如实展示）。
+  let quarantineHits = [];
+  if (db && s.batch_id != null) {
+    quarantineHits = require('./quarantine').controlledHitsForBatch(db, s.batch_id);
+  }
   return {
     id: s.id,
     shipment_code: s.shipment_code,
@@ -366,6 +396,11 @@ function formatShipment(s, db) {
     status: s.status,
     pending_review: s.status === 'PENDING_REVIEW',
     review_reason: s.review_reason || '',
+    quarantined: quarantineHits.length > 0,
+    quarantine_orders: quarantineHits.map((h) => ({
+      order_id: h.order_id, order_code: h.order_code,
+      classification: h.classification
+    })),
     shipped_at: s.shipped_at,
     shipped_by: s.shipped_by,
     created_at: s.created_at,
@@ -383,7 +418,7 @@ function batchBalance(db, batchId) {
   if (!batch) throw new ShipmentError('BATCH_NOT_FOUND', '批次不存在');
   const rollRows = db.prepare(
     `SELECT lr.id, lr.roll_code, lr.status, lr.print_qty, lr.applied_qty,
-            lr.void_qty, lr.revision,
+            lr.void_qty, lr.revision, lr.suspended, lr.suspended_reason,
             COALESCE((SELECT SUM(qty) FROM shipment_items si WHERE si.roll_id = lr.id), 0)
               AS allocated_qty
        FROM label_rolls lr
@@ -392,7 +427,8 @@ function batchBalance(db, batchId) {
   ).all(batchId);
 
   const rolls = rollRows.map((r) => {
-    const available = r.status === 'ACTIVE'
+    // 永久停用卷与质量隔离“暂停”卷的余额都不可出货；暂停可逆，隔离解除后自动恢复。
+    const available = r.status === 'ACTIVE' && !r.suspended
       ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0)
       : 0;
     return {
@@ -400,6 +436,8 @@ function batchBalance(db, batchId) {
       roll_code: r.roll_code,
       status: r.status,
       active: r.status === 'ACTIVE',
+      suspended: !!(r.suspended && r.status === 'ACTIVE'),
+      suspended_reason: r.suspended ? (r.suspended_reason || '') : '',
       print_qty: r.print_qty,
       applied_qty: r.applied_qty,
       void_qty: r.void_qty,
@@ -408,9 +446,15 @@ function batchBalance(db, batchId) {
     };
   });
 
+  const quarantineHits = require('./quarantine').controlledHitsForBatch(db, batchId);
   return {
     batch_id: batch.id,
     batch_code: batch.code,
+    quarantined: quarantineHits.length > 0,
+    quarantine_orders: quarantineHits.map((h) => ({
+      order_id: h.order_id, order_code: h.order_code,
+      classification: h.classification, reason: h.reason
+    })),
     shippable_qty: rolls.reduce((s, r) => s + r.available_qty, 0),
     applied_qty: rolls.reduce((s, r) => s + r.applied_qty, 0),
     allocated_qty: rolls.reduce((s, r) => s + r.allocated_qty, 0),

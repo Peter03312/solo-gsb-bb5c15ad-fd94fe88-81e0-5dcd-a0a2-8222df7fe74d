@@ -120,7 +120,8 @@ function unflagLot(db, id, body) {
   return getLot(db, id);
 }
 
-// 删除批号：已被投料记录引用的批号不允许删除（保证追溯证据完整），明确拒绝。
+// 删除批号：已被投料记录引用或已被质量隔离令引用（含已解除历史令）的批号不允许删除
+// （保证追溯与隔离证据完整），明确拒绝。
 function deleteLot(db, id) {
   const lot = getLot(db, id);
   if (!lot) throw new LotError('LOT_NOT_FOUND', `供应批号 #${id} 不存在`);
@@ -132,6 +133,16 @@ function deleteLot(db, id) {
       'LOT_IN_USE',
       `供应批号 ${lot.lot_code}（${lot.material_code}）已有 ${used} 条投料记录引用，不能删除；` +
       '如供应商通报异常，请将其标记为 FLAGGED 后发起批号追溯'
+    );
+  }
+  const orderCount = db.prepare(
+    'SELECT COUNT(*) AS c FROM quarantine_orders WHERE material_lot_id = ?'
+  ).get(id).c;
+  if (orderCount > 0) {
+    throw new LotError(
+      'LOT_IN_USE',
+      `供应批号 ${lot.lot_code}（${lot.material_code}）已有 ${orderCount} 张质量隔离令（含已解除历史令）引用，` +
+      '隔离令记录只增不改，批号不能删除'
     );
   }
   db.prepare('DELETE FROM material_lots WHERE id = ?').run(id);

@@ -17,6 +17,7 @@
   <button class="tab" data-tab="labels">过敏原标签卷</button>
   <button class="tab" data-tab="shipments">包装出货</button>
   <button class="tab" data-tab="trace">原料批号追溯</button>
+  <button class="tab" data-tab="quarantine">质量隔离令</button>
   <button class="tab" data-tab="events">事件时间线（加工 / 清洗）</button>
   <button class="tab" data-tab="downtime">检修停机</button>
   <button class="tab" data-tab="base">原料与设备</button>
@@ -111,6 +112,44 @@
       </div>
     </form>
     <div id="traceResult" class="trace-result"></div>
+  </section>
+
+  <!-- ============ 质量隔离令视图 ============ -->
+  <section id="tab-quarantine" class="tab-panel">
+    <div class="panel-head">
+      <h2>质量隔离令（原料供应批号）</h2>
+    </div>
+    <p class="section-hint">
+      质检针对<b>已登记的原料供应批号</b>签发质量隔离令，记录原因、操作人与时间；
+      <b>同一批号同时只能有一张生效令</b>（批号原有 FLAGGED 异常标记仅作留痕）。
+      生效范围按当前事件时间线的批号流向确定：<b>确定命中</b>与<b>因批号未知无法排除</b>的批次都受控，
+      下列明细展示传播依据；原料资料或事件更正、补录、换线或清洗后自动同步刷新范围。
+      受控批次<b>不得登记放行、标签卷或确认出货</b>，已有卷<b>暂停贴用但不永久停用</b>；
+      关联已出货单转<b>待评估</b>（隔离期间只能召回），有效的继续流转结论转<b>需重评</b>。
+      解除或流向变化使批次脱离所有生效令后恢复后续操作；待评估单及历史处置不自动恢复。
+    </p>
+    <form id="quarantineIssueForm" class="trace-form">
+      <div class="form-row">
+        <label>原料 <span class="req">*</span></label>
+        <select id="qMaterial" required></select>
+      </div>
+      <div class="form-row">
+        <label>供应批号 <span class="req">*</span></label>
+        <select id="qLot" required></select>
+      </div>
+      <div class="form-row">
+        <label>签发原因 <span class="req">*</span></label>
+        <input type="text" id="qReason" placeholder="如：供应商通报该批混入异常原料" required>
+      </div>
+      <div class="form-row">
+        <label>签发操作人 <span class="req">*</span></label>
+        <input type="text" id="qIssuedBy" placeholder="质检员姓名" required>
+      </div>
+      <div class="modal-actions">
+        <button type="submit" class="btn danger">签发隔离令</button>
+      </div>
+    </form>
+    <div id="quarantineList" class="quarantine-list"></div>
   </section>
 
   <!-- ============ 事件视图 ============ -->

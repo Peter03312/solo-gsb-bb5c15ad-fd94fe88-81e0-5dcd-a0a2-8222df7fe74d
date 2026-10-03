@@ -239,14 +239,39 @@ function recompute(db) {
 
   // ---- 出货单待评估：本次停用的卷若已分配给出货单，则相关单据置为待评估（终态不恢复）----
   const shipments = require('./shipments');
-  const pendingShipments = shipments.syncPendingShipments(db);
+  const pendingFromRolls = shipments.syncPendingShipments(db);
 
-  // ---- 质量处置结论核对：批次过敏原 / 有效放行 / 所用卷停用信息变化后，
+  // ---- 质量隔离令：按最新时间线重建生效范围（确定命中 + 批号未知无法排除都受控）----
+  // 卷暂停/恢复（可逆，不永久停用）；受控批次关联的已出货单转待评估。
+  const quarantine = require('./quarantine');
+  const scopeMap = quarantine.rebuildAllScope(db);
+  const qResult = quarantine.syncQuarantine(db, scopeMap);
+
+  // 合并“卷停用”与“隔离受控”两类来源的待评估单（去重：隔离同步时该单可能已在本事务转出）。
+  const pendingShipments = dedupeShipments(pendingFromRolls.concat(qResult.pendingShipments));
+
+  // ---- 质量处置结论核对：批次过敏原 / 有效放行 / 所用卷停用 / 隔离受控状态变化后，
   //      仍为 ACTIVE 的旧结论标为“需重新评估”（STALE，只增不改、不自动生效）----
+  // 必须在隔离范围与卷暂停同步之后执行：隔离导致的上下文变化在同一轮核对中生效。
   const evaluation = require('./evaluation');
   const staleDispositions = evaluation.syncStaleDispositions(db);
 
-  return { invalidated, retiredRolls, pendingShipments, staleDispositions };
+  return {
+    invalidated, retiredRolls, pendingShipments, staleDispositions,
+    suspendedRolls: qResult.suspendedRolls,
+    resumedRolls: qResult.resumedRolls
+  };
+}
+
+function dedupeShipments(list) {
+  const seen = new Set();
+  const out = [];
+  for (const s of list) {
+    if (!s || seen.has(s.id)) continue;
+    seen.add(s.id);
+    out.push(s);
+  }
+  return out;
 }
 
 module.exports = { recompute, replayTimeline, sortedJson, cleanScopeOf };

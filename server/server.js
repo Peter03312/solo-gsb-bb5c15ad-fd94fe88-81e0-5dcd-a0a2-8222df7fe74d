@@ -12,6 +12,7 @@ const evaluation = require('./evaluation');
 const lots = require('./lots');
 const backfill = require('./backfill');
 const downtime = require('./downtime');
+const quarantine = require('./quarantine');
 const { traceMaterial } = require('./trace');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -190,8 +191,8 @@ app.get('/api/state', (req, res) => {
     release_at: r.release_at,
     release_by: r.release_by,
     allocated_qty: r.allocated_qty || 0,
-    // 可出货余额：仅未停用卷的“已贴用 - 累计已分配”；停卷余量冻结不可出货。
-    shippable_qty: r.status === 'ACTIVE'
+    // 可出货余额：永久停用卷与质量隔离“暂停”卷均不可出货；暂停可逆，隔离解除后自动恢复。
+    shippable_qty: r.status === 'ACTIVE' && !r.suspended
       ? Math.max(r.applied_qty - (r.allocated_qty || 0), 0)
       : 0
   }));
@@ -202,7 +203,19 @@ app.get('/api/state', (req, res) => {
   // 设备检修停机窗口（含各窗口当前覆盖的冲突事件，正常恒为空：两侧写入均拒绝冲突）。
   const downtime_windows = downtime.listWindows(db);
 
-  res.json({ materials, equipment, events, batches, label_rolls, shipments: shipments_list, downtime_windows });
+  // 质量隔离令：生效令清单（含范围摘要）与按批次的受控命中（确定命中/批号未知无法排除）。
+  const quarantine_orders = quarantine.listOrders(db);
+  const quarantineByBatch = quarantine.quarantineState(db);
+  for (const b of batches) {
+    const hits = quarantineByBatch.get(b.id) || [];
+    b.quarantined = hits.length > 0;
+    b.quarantine_hits = hits;
+  }
+
+  res.json({
+    materials, equipment, events, batches, label_rolls,
+    shipments: shipments_list, downtime_windows, quarantine_orders
+  });
 });
 
 // ---------- 通用：在事务中写事件集 -> 校验 -> 重算 ----------
@@ -222,7 +235,9 @@ function mutateEvents(fn) {
       invalidated: recomputeResult.invalidated,
       retired_rolls: recomputeResult.retiredRolls,
       pending_shipments: recomputeResult.pendingShipments,
-      stale_dispositions: recomputeResult.staleDispositions
+      stale_dispositions: recomputeResult.staleDispositions,
+      suspended_rolls: recomputeResult.suspendedRolls,
+      resumed_rolls: recomputeResult.resumedRolls
     };
   })();
   return result;
@@ -254,8 +269,8 @@ app.put('/api/materials/:id', (req, res) => {
     ).run(code, name, JSON.stringify(allergens), req.params.id);
     if (!info.changes) return res.status(404).json({ error: '原料不存在' });
     // 过敏原被修改会改变批次推导结果，需要全量重算
-    const { invalidated, retired_rolls, pending_shipments, stale_dispositions } = mutateEvents(() => {});
-    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
+    const { invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls } = mutateEvents(() => {});
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -460,6 +475,77 @@ app.get('/api/trace/material-lot', (req, res) => {
   }
 });
 
+// ---------- 质量隔离令（针对已登记的原料供应批号签发/解除） ----------
+// 签发：body { lot_id } 或 { material_id, lot_code } + { reason, issued_by, issued_at? }
+// 同一批号同时只能有一张生效令；范围（确定命中 + 批号未知无法排除）随当前时间线确定，
+// 卷暂停、已出货单转待评估、旧结论需重评在同一事务内原子完成。
+app.post('/api/quarantine-orders', (req, res) => {
+  try {
+    res.json(quarantine.issueOrder(db, req.body || {}));
+  } catch (err) { sendQuarantineError(res, err); }
+});
+
+// 列表：?status=ACTIVE|RELEASED、?material_id=、?lot_id=
+app.get('/api/quarantine-orders', (req, res) => {
+  try {
+    let status = null;
+    if (req.query.status !== undefined) {
+      status = String(req.query.status).toUpperCase();
+      if (status !== 'ACTIVE' && status !== 'RELEASED') {
+        return res.status(400).json({
+          error: 'status 仅支持 ACTIVE 或 RELEASED', code: 'INVALID_REQUEST'
+        });
+      }
+    }
+    let material_id = null;
+    if (req.query.material_id !== undefined) {
+      material_id = parseInt(req.query.material_id, 10);
+      if (!Number.isInteger(material_id)) {
+        return res.status(400).json({ error: 'material_id 不合法', code: 'INVALID_REQUEST' });
+      }
+    }
+    let lot_id = null;
+    if (req.query.lot_id !== undefined) {
+      lot_id = parseInt(req.query.lot_id, 10);
+      if (!Number.isInteger(lot_id)) {
+        return res.status(400).json({ error: 'lot_id 不合法', code: 'INVALID_REQUEST' });
+      }
+    }
+    res.json({ orders: quarantine.listOrders(db, { status, material_id, lot_id }) });
+  } catch (err) { sendQuarantineError(res, err); }
+});
+
+// 单张隔离令（数字 id 或 QUAR-0001 令号）：含范围、传播依据与受控出货单
+app.get('/api/quarantine-orders/:idOrCode', (req, res) => {
+  try {
+    res.json(quarantine.getOrder(db, decodeURIComponent(String(req.params.idOrCode || ''))));
+  } catch (err) { sendQuarantineError(res, err); }
+});
+
+// 解除：body { reason, released_by, released_at? }；重复解除明确拒绝。
+// 范围重建、卷恢复、旧结论需重评原子完成；待评估单与历史处置不自动恢复。
+app.post('/api/quarantine-orders/:idOrCode/release', (req, res) => {
+  try {
+    res.json(quarantine.releaseOrder(
+      db, decodeURIComponent(String(req.params.idOrCode || '')), req.body || {}
+    ));
+  } catch (err) { sendQuarantineError(res, err); }
+});
+
+function sendQuarantineError(res, err) {
+  if (err && err.name === 'QuarantineError') {
+    const status = err.status || (
+      err.code === 'QUARANTINE_ORDER_EXISTS' ||
+      err.code === 'QUARANTINE_ORDER_ALREADY_RELEASED' ? 409 : 400
+    );
+    return res.status(status).json({
+      error: err.message, code: err.code, details: err.details
+    });
+  }
+  console.error(err);
+  return res.status(500).json({ error: err && err.message ? err.message : '服务器内部错误' });
+}
+
 // ---------- 事件 ----------
 // body: { event_time, type, equipment_id, batch_code, note, material_ids:[], ref_batch_ids:[] }
 app.post('/api/events', (req, res) => {
@@ -470,7 +556,8 @@ app.post('/api/events', (req, res) => {
     materialInputs = body.material_inputs !== undefined
       ? lots.resolveMaterialInputs(db, body.material_inputs)
       : body.material_ids.map((material_id) => ({ material_id, material_lot_id: null }));
-    const { ret, invalidated, retired_rolls, pending_shipments, stale_dispositions } = mutateEvents((d) => {
+    const { ret, invalidated, retired_rolls, pending_shipments, stale_dispositions,
+            suspended_rolls, resumed_rolls } = mutateEvents((d) => {
       let batchId = null;
       if (body.type === 'PROCESS') {
         batchId = d.prepare('INSERT INTO batches (code) VALUES (?)')
@@ -497,7 +584,7 @@ app.post('/api/events', (req, res) => {
       }
       return eid;
     });
-    res.json({ id: ret, invalidated, retired_rolls, pending_shipments, stale_dispositions });
+    res.json({ id: ret, invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls });
   } catch (err) { sendEventError(res, err); }
 });
 
@@ -516,7 +603,7 @@ app.put('/api/events/:id', (req, res) => {
         ? lots.resolveMaterialInputs(db, body.material_inputs)
         : body.material_ids.map((material_id) => ({ material_id, material_lot_id: null })))
       : [];
-    const { invalidated, retired_rolls, pending_shipments, stale_dispositions } = mutateEvents((d) => {
+    const { invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls } = mutateEvents((d) => {
       if (body.type === 'PROCESS') {
         d.prepare('UPDATE batches SET code=? WHERE id=?')
           .run(body.batch_code, existing.batch_id);
@@ -540,7 +627,7 @@ app.put('/api/events/:id', (req, res) => {
         existing.id
       );
     });
-    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls });
   } catch (err) { sendEventError(res, err); }
 });
 
@@ -602,8 +689,8 @@ app.delete('/api/events/:id', (req, res) => {
     } finally {
       if (needDetach) db.pragma('foreign_keys = ON');
     }
-    const { invalidated, retired_rolls, pending_shipments, stale_dispositions } = result;
-    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
+    const { invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls } = result;
+    res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions, suspended_rolls, resumed_rolls });
   } catch (err) { badRequest(res, err); }
 });
 
@@ -710,6 +797,17 @@ app.post('/api/releases', (req, res) => {
     const ev = db.prepare('SELECT id FROM events WHERE batch_id=?').get(batch_id);
     if (!out || !ev) return res.status(400).json({ error: '该批次尚无加工记录，无法放行' });
 
+    // 受控批次不得登记放行（质量隔离期间明确拒绝）。
+    const hits = quarantine.controlledHitsForBatch(db, batch_id);
+    if (hits.length) {
+      return res.status(409).json({
+        error: `该批次当前受 ${hits.length} 张质量隔离令控制，隔离期间不得登记放行；` +
+               '解除隔离或批次脱离全部生效令后方可恢复',
+        code: 'BATCH_QUARANTINED',
+        details: quarantine.hitDetails(hits)
+      });
+    }
+
     const snapshot = sortedJson(JSON.parse(out.allergens));
     let info;
     // 新增放行可能让旧处置上下文（有效放行集合）变化：同一事务内核对旧结论是否需重新评估。
@@ -773,7 +871,8 @@ app.post('/api/label-rolls/:id/consume', (req, res) => {
 function sendLabelError(res, err) {
   if (err && err.name === 'LabelError') {
     const status = (err.code === 'REVISION_MISMATCH' || err.code === 'OVER_LIMIT' ||
-      err.code === 'ROLL_RETIRED') ? 409 : 400;
+      err.code === 'ROLL_RETIRED' || err.code === 'ROLL_SUSPENDED' ||
+      err.code === 'BATCH_QUARANTINED') ? 409 : 400;
     if (err.code === 'ROLL_NOT_FOUND') return res.status(404).json({ error: err.message, code: err.code });
     return res.status(status).json({
       error: err.message,
@@ -884,7 +983,8 @@ function sendShipmentError(res, err) {
       return res.status(404).json({ error: err.message, code: err.code, details: err.details });
     }
     const status = (err.code === 'ROLL_RETIRED' || err.code === 'RELEASE_INACTIVE' ||
-      err.code === 'OVER_APPLIED') ? 409 : 400;
+      err.code === 'OVER_APPLIED' || err.code === 'ROLL_SUSPENDED' ||
+      err.code === 'BATCH_QUARANTINED') ? 409 : 400;
     return res.status(status).json({
       error: err.message,
       code: err.code,

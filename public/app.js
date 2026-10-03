@@ -81,6 +81,7 @@ async function refresh() {
   renderBase();
   renderLots();
   renderDowntime();
+  renderQuarantine();
 }
 
 function renderResidue() {
@@ -118,17 +119,23 @@ function renderBatches() {
   $('#batchList').innerHTML = state.batches.map((b) => {
     const validRelease = (b.releases || []).find((r) => r.status === 'ACTIVE');
     const invalidReleases = (b.releases || []).filter((r) => r.status === 'INVALIDATED');
+    const qHits = b.quarantine_hits || [];
     return `
-    <div class="batch-card">
+    <div class="batch-card ${qHits.length ? 'quarantined' : ''}">
       <div class="batch-head">
         <span class="batch-code">${esc(b.code)}</span>
         <span class="batch-meta">产出 ${b.produced_at ? esc(fmtTime(b.produced_at)) : '—'} · 设备 ${esc(b.equipment_code || '—')}</span>
         <span class="spacer"></span>
+        ${qHits.length
+          ? `<span class="badge danger" title="${esc(qHits.map((h) => `${h.order_code}（${h.classification === 'CONFIRMED' ? '确定命中' : '批号未知无法排除'}）`).join('；'))}">质量隔离中（${qHits.length} 令）</span>`
+          : ''}
         ${validRelease
           ? '<span class="badge active">放行有效</span>'
           : (invalidReleases.length ? '<span class="badge invalid">放行已失效</span>' : '<span class="tag none">未放行</span>')}
         <button class="btn small primary" onclick="openRelease(${b.id})">登记放行</button>
       </div>
+      ${qHits.length ? `<div class="quarantine-banner">⛔ ${qHits.map((h) =>
+        `受 ${esc(h.order_code)} 控制（${h.classification === 'CONFIRMED' ? '确定命中' : '因批号未知无法排除'}）`).join('；')}：不得登记放行/标签卷/确认出货</div>` : ''}
       ${renderBatchRollSummary(b.id)}
       <div style="margin-top:8px" class="tag-row">
         <b style="font-size:12.5px;color:var(--muted)">推导过敏原：</b>${allergenTags(b.allergens)}
@@ -195,14 +202,16 @@ function renderRolls() {
 
 function renderRollCard(r) {
   return `
-  <div class="roll-card ${r.active ? '' : 'retired'}">
+  <div class="roll-card ${r.active ? '' : 'retired'} ${r.suspended ? 'suspended' : ''}">
     <div class="roll-head">
       <span class="roll-code">${esc(r.roll_code)}</span>
       <span class="badge ${r.active ? 'active' : 'invalid'}">${r.active ? '使用中' : '已永久停用'}</span>
+      ${r.suspended ? '<span class="badge warn">隔离暂停贴用</span>' : ''}
       <span class="batch-meta">登记 ${esc(fmtTime(r.registered_at))} · ${esc(r.registered_by)}</span>
       <span class="spacer"></span>
       <span class="batch-meta">当前修订号 <b>${r.revision}</b></span>
     </div>
+    ${r.suspended ? `<div class="quarantine-banner">⏸ ${esc(r.suspended_reason || '该卷因质量隔离暂停贴用（不永久停用），隔离解除后自动恢复')}</div>` : ''}
     <div class="tag-row" style="margin:8px 0">
       <b class="batch-meta">拟印集合：</b>${allergenTags(r.allergens, '无过敏原')}
       ${r.release_id ? '' : '<span class="tag danger">绑定放行已删除</span>'}
@@ -1384,6 +1393,156 @@ $('#traceForm').onsubmit = async (e) => {
   }
 };
 function eq2(eq) { return `${eq.equipment_name}（${eq.equipment_code}）`; }
+
+// ================= 质量隔离令 =================
+function renderQuarantine() {
+  const form = $('#qMaterial');
+  if (!form) return;
+  const prevMat = form.value;
+  form.innerHTML = state.materials
+    .map((m) => `<option value="${m.id}">${esc(m.name)}（${esc(m.code)}）</option>`).join('');
+  if (prevMat) form.value = prevMat;
+  fillQuarantineLotOptions();
+
+  const orders = state.quarantine_orders || [];
+  const el = $('#quarantineList');
+  if (!el) return;
+  if (!orders.length) {
+    el.innerHTML = '<div class="batch-meta">尚无质量隔离令。选择已登记的供应批号可签发。</div>';
+    return;
+  }
+  el.innerHTML = orders.map((o) => {
+    const s = o.scope_summary || {};
+    const badge = o.active
+      ? '<span class="badge danger">生效中</span>'
+      : '<span class="tag none">已解除</span>';
+    return `
+    <div class="quarantine-card ${o.active ? 'active' : 'released'}">
+      <div class="roll-head">
+        <span class="roll-code">${esc(o.order_code)}</span>
+        ${badge}
+        <span class="batch-meta">${esc(o.material ? o.material.name : '')}（${esc(o.material ? o.material.code : '')}）
+          · 批号 ${esc(o.lot ? o.lot.lot_code : '')}${o.lot && o.lot.flagged ? ' · <span class="retired-text">批号已 FLAGGED（留痕）</span>' : ''}</span>
+        <span class="spacer"></span>
+        <button class="btn small" onclick="toggleQuarantineDetail('${esc(o.order_code)}')">范围/依据</button>
+        ${o.active ? `<button class="btn small primary" onclick="releaseQuarantine('${esc(o.order_code)}')">解除隔离令</button>` : ''}
+      </div>
+      <div class="batch-meta" style="margin:6px 0">
+        签发 ${esc(fmtTime(o.issued_at))} · ${esc(o.issued_by)}：${esc(o.reason)}
+        ${!o.active ? `<br>解除 ${esc(fmtTime(o.released_at))} · ${esc(o.released_by)}：${esc(o.released_reason)}` : ''}
+      </div>
+      ${o.active ? `<div class="tag-row">
+        <span class="badge danger">受控批次 ${s.controlled_batch_count || 0}</span>
+        <span class="batch-meta">确定命中 ${s.confirmed_batch_count || 0} · 因批号未知无法排除 ${s.unresolved_batch_count || 0}</span>
+      </div>` : '<div class="batch-meta">已解除：历史令与范围留痕，不自动恢复待评估单及历史处置。</div>'}
+      <div class="quarantine-detail hidden" id="qdetail-${esc(o.order_code)}" data-order="${esc(o.order_code)}">
+        <div class="batch-meta">加载中…</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function fillQuarantineLotOptions() {
+  const mid = parseInt($('#qMaterial').value, 10);
+  const m = (state.materials || []).find((x) => x.id === mid);
+  const lots = (m && m.lots) || [];
+  $('#qLot').innerHTML = lots.length
+    ? lots.map((l) => `<option value="${l.id}" ${l.flagged ? 'class="retired-text"' : ''}>${esc(l.lot_code)}${l.flagged ? '（已通报 FLAGGED）' : ''}</option>`).join('')
+    : '<option value="">（该原料尚无已登记批号）</option>';
+}
+$('#qMaterial').addEventListener('change', fillQuarantineLotOptions);
+
+$('#quarantineIssueForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const lot_id = parseInt($('#qLot').value, 10);
+  if (!Number.isInteger(lot_id)) { notice('error', '请先为该原料登记供应批号'); return; }
+  try {
+    const r = await api('/api/quarantine-orders', {
+      method: 'POST',
+      body: {
+        lot_id,
+        reason: $('#qReason').value.trim(),
+        issued_by: $('#qIssuedBy').value.trim()
+      }
+    });
+    $('#qReason').value = '';
+    $('#qIssuedBy').value = '';
+    await refresh();
+    const s = r.scope ? r.scope : {};
+    notice('ok',
+      `隔离令 ${r.order_code} 已签发：受控批次 ${s.controlled_batch_count || 0}` +
+      `（暂停卷 ${(r.effects?.suspended_rolls || []).length}，待评估出货单 ${(r.effects?.pending_shipments || []).length}）`,
+      (r.effects?.pending_shipments || []).map((x) => `${x.shipment_code} 转待评估`));
+  } catch (err) { notice('error', err.error || '签发失败', err.details); }
+});
+
+window.toggleQuarantineDetail = async function (code) {
+  const box = $(`#qdetail-${code}`);
+  if (!box) return;
+  if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  if (box.dataset.loaded === '1') return;
+  try {
+    const r = await api(`/api/quarantine-orders/${encodeURIComponent(code)}`);
+    box.dataset.loaded = '1';
+    const sec = (title, list, cls) => list.length
+      ? `<h4 class="sub-head">${title}</h4>${list.map((b) => renderQuarantineBatch(b, cls)).join('')}`
+      : `<h4 class="sub-head">${title}</h4><div class="batch-meta">无</div>`;
+    box.innerHTML = `
+      ${sec('确定命中批次', r.scope.confirmed_batches, 'CONFIRMED')}
+      ${sec('因批号未知无法排除批次', r.scope.unresolved_batches, 'UNRESOLVED')}
+      ${(r.equipment_residue || []).length ? `
+        <h4 class="sub-head">设备残留（批号可能仍滞留）</h4>
+        <div class="trace-residue">${r.equipment_residue.map((eq) => `
+          <div class="residue-card"><h4>${esc(eq2(eq))}</h4>
+            ${eq.confirmed_chains.length ? `<ul class="trace-paths">${eq.confirmed_chains.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+            ${eq.unresolved_chains.length ? `<ul class="trace-paths">${eq.unresolved_chains.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+          </div>`).join('')}</div>` : ''}`;
+  } catch (err) {
+    box.innerHTML = '';
+    notice('error', err.error || '加载范围失败', err.details);
+  }
+};
+
+function renderQuarantineBatch(b, cls) {
+  const ev = b.evidence || {};
+  const routes = ev.routes || {};
+  const routeTags = [
+    routes.direct ? '直接投料' : null,
+    routes.batch_reference ? '前序引用' : null,
+    routes.equipment_residue ? '设备残留' : null
+  ].filter(Boolean).join(' / ') || '—';
+  const ships = b.shipments || [];
+  return `
+  <div class="trace-batch ${cls === 'CONFIRMED' ? 'confirmed' : 'unresolved'}">
+    <div class="trace-batch-head">
+      <b>${esc(b.batch_code)}</b>
+      <span class="badge ${cls === 'CONFIRMED' ? 'danger' : 'warn'}">${cls === 'CONFIRMED' ? '确定命中' : '无法排除'}</span>
+      <span class="batch-meta">进入方式：${esc(routeTags)}</span>
+    </div>
+    <ul class="trace-paths">${(ev.chains || []).map((c) => `<li class="${traceChainClass(c)}">${esc(c)}</li>`).join('')}</ul>
+    ${ships.length ? `<div class="batch-meta">关联出货单：${ships.map((s) =>
+      `${esc(s.shipment_code)}（${s.status === 'PENDING_REVIEW' ? '待评估' : '已出货'}${s.current_disposition ? `，当前结论：${s.current_disposition.decision_text}${s.current_disposition.needs_review ? '/需重评' : ''}` : ''}）`).join('；')}</div>` : ''}
+  </div>`;
+}
+
+window.releaseQuarantine = async function (code) {
+  const reason = prompt(`解除隔离令 ${code} 的原因（必填；待评估单与历史处置不会自动恢复）：`, '供应商复检合格，解除隔离');
+  if (reason === null) return;
+  const released_by = prompt('解除操作人：', '质检员');
+  if (released_by === null) return;
+  try {
+    const r = await api(`/api/quarantine-orders/${encodeURIComponent(code)}/release`, {
+      method: 'POST',
+      body: { reason: reason.trim(), released_by: released_by.trim() }
+    });
+    await refresh();
+    notice('ok',
+      `隔离令 ${r.order_code} 已解除；恢复贴用卷 ${(r.effects?.resumed_rolls || []).length}，` +
+      '待评估出货单与历史处置不自动恢复',
+      (r.effects?.resumed_rolls || []).map((x) => `${x.roll_code} 恢复贴用`));
+  } catch (err) { notice('error', err.error || '解除失败', err.details); }
+};
 
 // ================= 启动 =================
 refresh().catch((err) => notice('error', '加载状态失败', err.message || String(err)));
